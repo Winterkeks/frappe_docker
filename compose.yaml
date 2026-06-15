@@ -57,13 +57,11 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+        if [ -d "sites/${SITE_NAME}" ]; then echo "Site existiert bereits"; exit 0; fi;
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password="${ADMIN_PASSWORD}" --db-root-username=root --db-root-password="${DB_PASSWORD}" --install-app hrms --set-default "${SITE_NAME}"
     environment:
       DB_HOST: db
       DB_PORT: "3306"
