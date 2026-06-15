@@ -43,7 +43,8 @@ services:
       args:
         FRAPPE_PATH: https://github.com/frappe/frappe
         FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-15}
-        APPS_JSON_BASE64: ${APPS_JSON_BASE64}
+      secrets:
+        - apps_json
     environment:
       GUNICORN_WORKERS: 2
       GUNICORN_THREADS: 4
@@ -185,3 +186,7 @@ volumes:
   db-data:
   redis-cache-data:
   redis-queue-data:
+
+secrets:
+  apps_json:
+    file: ./apps.json
