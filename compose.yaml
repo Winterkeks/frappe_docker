@@ -1,29 +1,59 @@
-x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/02-setup/02-build-setup.md#define-custom-apps
-  # about using custom images.
-  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
-  pull_policy: ${PULL_POLICY:-always}
-  restart: ${RESTART_POLICY:-unless-stopped}
+# ─────────────────────────────────────────────────────────────────────────
+# Frappe HR auf Coolify – selbst gebaut aus dem OFFIZIELLEN frappe_docker
+# ─────────────────────────────────────────────────────────────────────────
+# So funktioniert es:
+#   - Coolify zieht DEIN Repo (Fork von github.com/frappe/frappe_docker) das
+#     diese Datei + die apps.json enthaelt.
+#   - Coolify BAUT das Image selbst aus images/custom/Containerfile und backt
+#     dabei frappe + erpnext + hrms hinein (gesteuert ueber APPS_JSON_BASE64).
+#   - Danach laufen alle Dienste aus genau diesem einen Image.
+#   - Der Dienst "create-site" legt einmalig die Site an und installiert HR.
+#
+# In Coolify zu setzen (Environment Variables):
+#   APPS_JSON_BASE64   = <dein langer base64-String aus apps.json>   (Build-Variable!)
+#   SITE_NAME          = deine-domain.de   (genau deine Coolify-Domain)
+#   ADMIN_PASSWORD     = <sicheres Admin-Passwort>
+#   DB_PASSWORD        = <sicheres DB-Passwort>
+#   FRAPPE_BRANCH      = version-15
+#
+# In Coolify die Domain dem Dienst "frontend" (interner Port 8080) zuweisen.
+# SSL macht Coolify selbst – KEINE https-Overrides noetig.
+# ─────────────────────────────────────────────────────────────────────────
 
-x-depends-on-configurator: &depends_on_configurator
+x-customizable-image: &customizable_image
+  image: frappe-hr-custom:latest
+  pull_policy: never
+  restart: unless-stopped
+
+x-backend-defaults: &backend_defaults
+  <<: *customizable_image
   depends_on:
     configurator:
       condition: service_completed_successfully
-
-x-backend-defaults: &backend_defaults
-  <<: [*depends_on_configurator, *customizable_image]
   volumes:
     - sites:/home/frappe/frappe-bench/sites
 
 services:
-  configurator:
+  # ── Baut das Image (nur hier definiert, alle anderen nutzen es mit) ──────
+  backend:
     <<: *backend_defaults
-    platform: linux/amd64
-    entrypoint:
-      - bash
-      - -c
-    # add redis_socketio for backward compatibility
+    build:
+      context: .
+      dockerfile: images/custom/Containerfile
+      args:
+        FRAPPE_PATH: https://github.com/frappe/frappe
+        FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-15}
+        APPS_JSON_BASE64: ${APPS_JSON_BASE64}
+    environment:
+      GUNICORN_WORKERS: 2
+      GUNICORN_THREADS: 4
+      GUNICORN_TIMEOUT: 120
+
+  # ── Schreibt DB/Redis-Verbindung in die globale Config ───────────────────
+  configurator:
+    <<: *customizable_image
+    depends_on: {}
+    entrypoint: ["bash", "-c"]
     command:
       - >
         ls -1 apps > sites/apps.txt;
@@ -33,68 +63,125 @@ services:
         bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
         bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
         bench set-config -gp socketio_port $$SOCKETIO_PORT;
-        bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
     environment:
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      REDIS_CACHE: ${REDIS_CACHE:-}
-      REDIS_QUEUE: ${REDIS_QUEUE:-}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
     restart: on-failure
 
-  backend:
-    <<: *backend_defaults
-    platform: linux/amd64
-    environment:
-      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
-      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
-      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
-
+  # ── Nginx, bekommt in Coolify die Domain (interner Port 8080) ────────────
   frontend:
     <<: *customizable_image
-    platform: linux/amd64
-    command:
-      - nginx-entrypoint.sh
+    command: ["nginx-entrypoint.sh"]
     environment:
       BACKEND: backend:8000
       SOCKETIO: websocket:9000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
-      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
-      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
-      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
-      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
-      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     depends_on:
       - backend
       - websocket
+    expose:
+      - "8080"
 
   websocket:
-    <<: [*depends_on_configurator, *customizable_image]
-    platform: linux/amd64
-    command:
-      - node
-      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    <<: *customizable_image
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
     volumes:
       - sites:/home/frappe/frappe-bench/sites
 
   queue-short:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench worker --queue short,default
 
   queue-long:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench worker --queue long,default,short
 
   scheduler:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench schedule
 
-# ERPNext requires local assets access (Frappe does not)
+  # ── Datenbank ────────────────────────────────────────────────────────────
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    healthcheck:
+      test: mysqladmin ping -h localhost --password=${DB_PASSWORD}
+      interval: 2s
+      retries: 25
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+
+  # ── Redis (Cache + Queue) ─────────────────────────────────────────────────
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  # ── Einmaliger Job: legt die Site an und installiert HR ───────────────────
+  create-site:
+    <<: *customizable_image
+    pull_policy: never
+    restart: "no"
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        if [ -d "sites/${SITE_NAME}" ]; then
+          echo "Site ${SITE_NAME} existiert bereits – ueberspringe.";
+          exit 0;
+        fi;
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        bench new-site
+          --mariadb-user-host-login-scope='%'
+          --admin-password=${ADMIN_PASSWORD}
+          --db-root-username=root
+          --db-root-password=${DB_PASSWORD}
+          --install-app hrms
+          --set-default ${SITE_NAME};
+
 volumes:
   sites:
+  db-data:
+  redis-cache-data:
+  redis-queue-data:
